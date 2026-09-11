@@ -7,14 +7,25 @@ Companion to [ebfio/glm53-flash-dflash2-gb300](https://github.com/ebfio/glm53-fl
 — same class of machine, same "make the upstream image work on this GPU" problem, different
 failure modes.
 
-> **SM103, not SM100.** nvidia-smi reports `compute_cap 10.3` on this box, and that is the
-> whole bug: the upstream image builds `TORCH_CUDA_ARCH_LIST="8.7 8.9 9.0 10.0+PTX 12.0"`
-> — it carries an **SM100** cubin and `10.0` PTX, but nothing for **10.3**. Meanwhile vLLM's
-> arch gates use `has_device_capability(90)` and `is_device_capability_family(100)`, and
-> `103 // 10 == 10`, so **every family-100 check admits SM103** into code paths whose
-> prebuilt kernels do not cover it. Three distinct bugs fall out of that gap. All three are
-> fixed here by **bind-mounting patched Python over site-packages** — no rebuild, no fork,
-> no toolchain.
+> **SM103, not SM100.** nvidia-smi reports `compute_cap 10.3` on this box. The upstream
+> image builds `TORCH_CUDA_ARCH_LIST="8.7 8.9 9.0 10.0+PTX 12.0"`, and inspection of the
+> shipped `_C_stable_libtorch` shows what that actually produced:
+>
+> ```
+> CUBINs: sm_80, sm_87, sm_89, sm_90, sm_90a, sm_100, sm_100a, sm_120, sm_120a
+> PTX:    sm_80, sm_89, sm_90        ← no sm_100/sm_103 PTX, nothing JITs forward
+> ```
+>
+> So there **is** SM100 code (`sm_100` and the arch-specific `sm_100a`), and **no**
+> `sm_100`/`compute_100` PTX — which means nothing JIT-compiles forward onto 10.3. The
+> `sm_100a` cubins are the sharp edge: an `a`-suffixed cubin runs on *exactly* its target
+> arch and never on a later one, so SM103 silently has no image for those kernels.
+>
+> That explains **bug 2 below only**. Bugs 1 and 3 are host-side Python layout problems —
+> no kernel is involved, and they would fire on any arch whose code path reaches them.
+> They are not SM103-specific in principle; they are SM103-specific *in practice* here
+> because of which arch gates select those paths, and I have not located the exact gate
+> that makes them fire on 10.3 but not on 10.0. See the caveat at the end.
 
 ```
 patches/
@@ -85,6 +96,14 @@ rel err vs float reference: 2.0e-3
 The relayout is a reinterpretation (no dtype change, no value change), so numerics are
 identical to a correctly packed tensor.
 
+**This is a per-call copy.** `transpose.contiguous.transpose` runs inside `fp8_einsum` on
+every layer, every step — about 1 MB × 40 layers per forward, so cheap, but it is a
+runtime fix. The cleaner version is a one-shot repack of `wo_a.weight_scale` right after
+load (E8M0 → FP32 → DeepGEMM's own `get_mn_major_tma_aligned_packed_ue8m0_tensor`), which
+also drops any assumption about the byte order of whatever produced the K-major tensor.
+The 2.0e-3 rel-err below and the `17*19 → 323` check validate that assumption for this
+build, so the switch should be safe — it just has not been done here.
+
 ### 2. `sparse_attn_indexer.py` — `cooperative_topk` has no SM103 cubin
 
 ```python
@@ -124,26 +143,50 @@ Two flags differ from a naive SM90 port, and both are load-bearing:
 | `--cpu-offload-gb` | **75** | see the sweep below. |
 | `--moe-backend` / `--linear-backend` | **marlin** | **required on this image** — see below. |
 
-**Marlin is mandatory** even though the GB300 supports the native path. In auto mode
-vLLM picks `DEEPGEMM_MXFP4`, which hits the same layout bug family on the *expert* scales
-in `oracle/mxfp4.py::_pack_deepgemm_mxfp4_scales` (unfixed here — it is a prefill-time
-win at most, and decode is fine on Marlin). FlashInfer's CUTLASS MXFP8 linear kernel also
-rejects the offloaded weight strides (`Mismatched mB.strides[1]`). Pinning both to Marlin
-sidesteps both.
+**Backends: both pinned to Marlin.** `--moe-backend marlin --linear-backend marlin` is what
+the config above runs. Neither pin is a device-support limitation and neither is
+permanent — they are two separate open items:
+
+- **`DEEPGEMM_MXFP4`** (the auto-selected MoE backend) asserts inside
+  `m_grouped_fp8_fp4_gemm_nt_contiguous` on the 3-D expert scale tensor. In the
+  contiguous-grouped layout SFA is 2-D, so the `stride(-3)` check can only be firing on
+  SFB — the same check bug 1 trips, on a tensor produced at load by
+  `oracle/mxfp4.py::_pack_deepgemm_mxfp4_scales`. By analogy with bug 1 the fix should be
+  the same K-major → grouped MN-major relayout of those packed scales, but **I did not
+  probe or fix it** — treat that as expected, not established.
+  What it costs: prefill throughput. At ≤4 streams decode is weight-bandwidth-bound and
+  Marlin's dequant path is close to the native kernel; the number the native path would
+  move is the ~4.1K tok/s prefill figure, not the decode figure.
+- **FlashInfer CUTLASS MXFP8** (the auto-selected linear backend) fails
+  `Mismatched mB.strides[1]` — a stride rejection, not a device-capability one.
+  `MarlinMxfp8LinearKernel` accepts the same tensors, and these are the small dense
+  projections, so there is nothing to gain at this concurrency.
+
+To try the native MoE path: put the bug-1 diagnostic on SFB inside `_grouped_fp4_impl`,
+apply the same relayout, drop `--moe-backend marlin`, re-run `verify.sh`.
 
 ### CPU offload: the floor is structural
 
 Non-Engram weights total **287.7 GiB**; the HBM budget at `gmu 0.92` is **230.6 GiB**.
 At least **57 GiB must be offloaded** no matter how you configure it. Measured sweep:
 
-| `--cpu-offload-gb` | KV cache | concurrency @1M | median decode |
-|---|---|---|---|
-| 90 | 11.0M tok | 10.50× | — (wastes RAM) |
-| **75** | **4.46M tok** | **4.25×** | **91.7 tok/s** |
-| 70 | 1.26M tok | 1.20× | 79.9 tok/s |
+| `--cpu-offload-gb` | KV cache | concurrency @1M |
+|---|---|---|
+| 90 | 11.0M tok | 10.50× |
+| **75** | **4.46M tok** | **4.25×** |
+| 70 | 1.26M tok | 1.20× |
 
-Below 75 it gets **slower**: KV starvation costs more than the extra resident experts
-gain. 75 is the sweet spot.
+**75 is the choice for KV headroom**: it keeps 4.25× concurrency at 1M context while
+still pulling 15 GiB of experts back into HBM versus 90. Below 75 the pool collapses
+(1.20× at 70), which is a capacity problem for a shared endpoint, not a speed one.
+
+> A note on the decode column this table used to carry: single-stream decode does not
+depend on KV pool size, so the 91.7 vs 79.9 tok/s I first reported here was measuring
+> DSpark acceptance on two different prompts, not the effect of the offload change.
+> Acceptance varies a lot with prompt predictability, which makes single-sample tok/s a
+> poor instrument for config decisions. The offload choice above rests on the KV numbers;
+> if you want the speed column to mean something, fix one prompt, temperature 0, take ≥5
+> reps, and record mean accepted length alongside tok/s.
 
 ## Usage
 
@@ -186,7 +229,10 @@ correctness check, never just a health check.
 Ubuntu 24.04, 64K-page kernel (`6.17.0-nvidia-64k`), driver 610.43.02.
 
 - Image: `vllm/vllm-openai:deepseekv41-flash-0909-cu129-arm64`
-  (vLLM `0.1.dev20904+g179dd0fa9`, torch 2.13.0+cu129), vendored DeepGEMM v2.1.x
+  (vLLM `0.1.dev20904+g179dd0fa9`, torch 2.13.0+cu129), 2026 vendored DeepGEMM of
+  unknown tag. The assert text and the INT-at-`gran_k=32` branch rules out the v2.1.1
+  tag specifically (v2.1.1 gates that branch to `gran_k == 128`); the exact revision is
+  not pinned anywhere in the image.
 - Model: `deepseek-ai/DeepSeek-V4.1-Flash`
 - GPU selected by **UUID** (`device_ids: ['GPU-…']`), not index — the box also exposes an
   RTX PRO 4000 that must not be picked up accidentally
@@ -214,6 +260,25 @@ Standing on the shoulders of:
 - **Native `DEEPGEMM_MXFP4` experts**: blocked on the same layout bug class in
   `_pack_deepgemm_mxfp4_scales`. Worth fixing for long-prompt prefill; irrelevant for
   low-concurrency decode, where Marlin is fine.
+
+## Open questions
+
+Things I have not established, stated plainly so nobody builds on them:
+
+- **Why bugs 1 and 3 are SM103-only.** They are host-side layout asserts, so an exact
+  10.0 device should be able to reach the same code. vLLM's own recipe runs this image on
+  GB200 NVL4 (SM100) at TP4, which suggests something selects these paths only on 10.3 —
+  but `has_device_capability(100)` is a *minimum* check and returns `True` on SM103, and a
+  grep for exact-100 gates in the V4/V4.1 model, quantization and MoE-oracle trees found
+  nothing. The gate is either elsewhere or the difference is in the packed-weight layout
+  rather than the gate. Not located.
+- **Whether the MoE fix is really the same fix.** See the backend section — reasoned by
+  analogy, not tested. A reproducing test needs real `expert_ids` from
+  `deepgemm_moe_permute`; hand-built ones die earlier at `gemm.hpp:293 m == m__`.
+- **Whether SM103 has any path to the native kernels at all** without an image rebuild.
+  The `sm_100a` cubins are unusable here and no forward-compatible PTX is shipped, so the
+  only routes are a rebuild with `10.3a`/`compute_103` in the arch list, or staying on
+  Marlin.
 
 ## License / usage notes
 
