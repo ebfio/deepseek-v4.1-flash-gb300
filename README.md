@@ -1,14 +1,20 @@
-# DeepSeek-V4.1-Flash on GB300 (SM103)
+# DeepSeek-V4.1-Flash on DGX Station GB300 (SM103) — patches for the official vLLM image
 
-Run **DeepSeek-V4.1-Flash** on an NVIDIA **GB300 / B300 (SM103)** with the official
-`vllm/vllm-openai:deepseekv41-flash-*` image.
+Run **DeepSeek-V4.1-Flash** (522B MoE / 8-16B active) on an **NVIDIA DGX Station GB300**
+with the official `vllm/vllm-openai:deepseekv41-flash-*` image.
 
-The upstream image builds `TORCH_CUDA_ARCH_LIST="8.7 8.9 9.0 10.0+PTX 12.0"` — **there is
-no SM103 cubin** — while vLLM's arch gates use `has_device_capability(90)` and
-`is_device_capability_family(100)`, both of which admit SM103 and route into code paths
-whose prebuilt kernels do not cover it. Three bugs fall out of that gap. All three are
-fixed here by **bind-mounting patched Python over site-packages** — no rebuild, no fork,
-no toolchain.
+Companion to [ebfio/glm53-flash-dflash2-gb300](https://github.com/ebfio/glm53-flash-dflash2-gb300)
+— same class of machine, same "make the upstream image work on this GPU" problem, different
+failure modes.
+
+> **SM103, not SM100.** nvidia-smi reports `compute_cap 10.3` on this box, and that is the
+> whole bug: the upstream image builds `TORCH_CUDA_ARCH_LIST="8.7 8.9 9.0 10.0+PTX 12.0"`
+> — it carries an **SM100** cubin and `10.0` PTX, but nothing for **10.3**. Meanwhile vLLM's
+> arch gates use `has_device_capability(90)` and `is_device_capability_family(100)`, and
+> `103 // 10 == 10`, so **every family-100 check admits SM103** into code paths whose
+> prebuilt kernels do not cover it. Three distinct bugs fall out of that gap. All three are
+> fixed here by **bind-mounting patched Python over site-packages** — no rebuild, no fork,
+> no toolchain.
 
 ```
 patches/
@@ -17,11 +23,12 @@ patches/
   o_proj.py                # one-shot layout diagnostic (drop-safe)
 examples/
   docker-compose.yml       # working config, all values measured
+  verify.sh                # math / long-context / tool-calling checks
 ```
 
 ## Results
 
-Single GB300, `--tensor-parallel-size 1`, thinking off:
+DGX Station GB300, single GPU, `--tensor-parallel-size 1`, thinking off:
 
 | metric | value |
 |---|---|
@@ -34,7 +41,10 @@ Single GB300, `--tensor-parallel-size 1`, thinking off:
 | tool calling | clean `tool_calls`, `finish_reason=tool_calls` |
 
 For reference, the same checkpoint on a GH200 (SM90, MARLIN, `--cpu-offload-gb 210`)
-runs at **~14 tok/s**. Same model, **~6.5×** faster here.
+runs at **~14 tok/s**. Same model, **~6.5×** faster on the Station.
+
+Reproduce the numbers with `examples/verify.sh` (tests correctness, not speed — a
+wrong-but-legal scale layout produces garbage text, never an assert).
 
 ## The three bugs
 
@@ -171,10 +181,29 @@ correctness check, never just a health check.
 
 ## Tested environment
 
-- GPU: NVIDIA GB300 (SM103), 256 GB HBM3e, arm64 Grace host
+**NVIDIA DGX Station GB300** — single GB300 GPU (SM103 / compute capability 10.3),
+256 GB HBM3e, 494 GB unified LPDDR5x via NVLink-C2C, 72-core Neoverse-V2 (aarch64),
+Ubuntu 24.04, 64K-page kernel (`6.17.0-nvidia-64k`), driver 610.43.02.
+
 - Image: `vllm/vllm-openai:deepseekv41-flash-0909-cu129-arm64`
-  (vLLM `0.1.dev20904+g179dd0fa9`), vendored DeepGEMM v2.1.x
+  (vLLM `0.1.dev20904+g179dd0fa9`, torch 2.13.0+cu129), vendored DeepGEMM v2.1.x
 - Model: `deepseek-ai/DeepSeek-V4.1-Flash`
+- GPU selected by **UUID** (`device_ids: ['GPU-…']`), not index — the box also exposes an
+  RTX PRO 4000 that must not be picked up accidentally
+
+## Credits
+
+Standing on the shoulders of:
+
+- [tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)
+  — the 4×DGX-Spark reference deployment for this exact model; its boot log (`docs/boot*.md`)
+  is the best available field guide to running V4.1 on Blackwell. Their launcher's
+  `--block-size 128`, `--engram-config` handling and DSpark settings informed this config.
+- [vLLM](https://github.com/vllm-project/vllm) — the DeepSeek-V4.1 model code, the
+  `deepseek_v41` tokenizer/parsers, and the layout asserts we work around.
+- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) — `csrc/utils/layout.hpp` is what
+  defines the required grouped-scale layout.
+- [DeepSeek-AI](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) — the model.
 
 ## Known dead ends
 
@@ -186,7 +215,13 @@ correctness check, never just a health check.
   `_pack_deepgemm_mxfp4_scales`. Worth fixing for long-prompt prefill; irrelevant for
   low-concurrency decode, where Marlin is fine.
 
-## License
+## License / usage notes
 
-Patch files are derivative works of vLLM (Apache-2.0). Everything in this repository is
-provided under Apache-2.0; see `LICENSE`.
+- Everything in this repository is **Apache-2.0**; see `LICENSE`.
+- `patches/*.py` are **derivative works of vLLM** (Apache-2.0). They contain
+  upstream code, modified — not clean-room rewrites.
+- The model is subject to **DeepSeek's own license**; this repo ships no weights.
+- Validated on **one DGX Station GB300 at TP1**. Other SM103 configs (multi-GPU /
+  P/D-disaggregated) are untested, and a different GB300 SKU could report a different
+  compute capability — check `nvidia-smi --query-gpu=compute_cap` before assuming these
+  patches apply.
