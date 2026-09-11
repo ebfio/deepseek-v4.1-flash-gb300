@@ -457,6 +457,20 @@ def cublaslt_gemm_nt(*args, **kwargs):
     return _cublaslt_gemm_nt_impl(*args, **kwargs)
 
 
+_DGP_SEEN = set()
+
+
+def _dgp_log(tag, shape, stride):
+    """One line per distinct tensor shape, then quiet."""
+    key = (tag, tuple(shape))
+    if key in _DGP_SEEN:
+        return
+    _DGP_SEEN.add(key)
+    import logging
+    logging.getLogger("dsv41.scales").info(
+        "%s %s -> %s", tag, tuple(shape), tuple(stride))
+
+
 def _dg_fix_grouped_sf(sf):
     """Rebuild a grouped int32 UE8M0 scale tensor into DeepGEMM's required layout
     for fp8_einsum / grouped GEMMs (v2.1.x csrc/utils/layout.hpp::check_sf_layout):
@@ -478,7 +492,9 @@ def _dg_fix_grouped_sf(sf):
         return sf
     if sf.stride(-2) == 1 and sf.stride(-3) == sf.stride(-1) * sf.size(-1):
         return sf  # already valid
-    return sf.transpose(-1, -2).contiguous().transpose(-1, -2)
+    fixed = sf.transpose(-1, -2).contiguous().transpose(-1, -2)
+    _dgp_log("relayout", fixed.shape, fixed.stride())
+    return fixed
 
 
 def fp8_gemm_nt(*args, **kwargs):
@@ -534,9 +550,16 @@ def transform_sf_into_required_layout(*args, **kwargs):
     _lazy_init()
     if _transform_sf_into_required_layout_impl is None:
         return _missing(*args, **kwargs)
-    return _transform_sf_into_required_layout_impl(
+    out = _transform_sf_into_required_layout_impl(
         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
     )
+    # On this build the grouped (int32, 3-D) result comes back row-major:
+    # stride(-2) != 1, which DeepGEMM's own grouped kernels then reject in
+    # csrc/utils/layout.hpp::check_sf_layout. Rebuild it grouped MN-major.
+    # This is the single choke point every scale producer routes through, so
+    # fixing it here covers the MoE expert scales and the attention o_proj
+    # weight scales at once, at load time (no per-forward cost).
+    return _dg_fix_grouped_sf(out)
 
 
 def fp8_fp4_mqa_logits(

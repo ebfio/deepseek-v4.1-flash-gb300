@@ -59,50 +59,68 @@ wrong-but-legal scale layout produces garbage text, never an assert).
 
 ## The three bugs
 
-### 1. `deep_gemm.py` — o_proj weight-scale layout
+All three are the same shape of problem: vLLM's Blackwell code paths hand DeepGEMM
+grouped scale tensors in a layout its kernels reject. Bug 1 is fixed at the **load-time
+producer** so the fix covers every consumer at once.
 
-`vllm/models/deepseek_v4/nvidia/ops/o_proj.py` calls `fp8_einsum` for the attention
-output projection. DeepGEMM validates the grouped scale tensors in
-`csrc/utils/layout.hpp::check_sf_layout`:
+### 1. grouped UE8M0 scale layout — `fp8_utils.py` + `deep_gemm.py`
+
+DeepGEMM validates grouped scale tensors in `csrc/utils/layout.hpp::check_sf_layout`:
 
 ```cpp
-DG_HOST_ASSERT(sf.stride(-2) == 1);
-DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size()));
+DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));                     // shape
+DG_HOST_ASSERT(sf.stride(-2) == 1);                                       // MN-major
+DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, elem_size));     // TMA-aligned
 if (num_groups.has_value())
-    DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));
+    DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));         // no group padding
 ```
 
-The **activation** scales (`sfa`, from `fused_inv_rope_fp8_quant(tma_aligned_scales=True)`)
-already satisfy this. The **weight** scales (`sfb`, from the load-time
-`deepgemm_post_process_weight_scale_block`) are emitted row-major and do not:
+vLLM's load-time packer emits the packed int32 UE8M0 tensor **row-major**, so
+`stride(-2) != 1` and the first grouped kernel to touch it dies:
 
 ```
 RuntimeError: Assertion error (csrc/utils/layout.hpp:113):
   sf.stride(-3) == sf.stride(-1) * sf.size(-1)
 ```
 
-Fix: relayout **SFB only** (`transpose(-1,-2).contiguous().transpose(-1,-2)`), applied
-inside the `fp8_einsum` wrapper. Verified against the real kernel:
+This single defect blocks **both** the attention `o_proj` (`fp8_einsum`) and the MoE
+expert scales — the same producer,
+`deepgemm_post_process_weight_scale_block`, feeds both.
+
+Fix, in two places:
+
+- **`patches/fp8_utils.py`** relayouts at load, inside
+  `deepgemm_post_process_weight_scale_block`, padding `mn` to a multiple of 4 so the
+  TMA-aligned-stride check holds for shapes where `mn % 4 != 0`. This is what unblocks
+  the native MoE path.
+- **`patches/deep_gemm.py`** relayouts the result of
+  `transform_sf_into_required_layout` — the choke point every producer routes through,
+  including the direct callers in `models/deepseek_v4/nvidia/model.py` that bypass
+  `fp8_utils` — and keeps a relayout inside the `fp8_einsum` wrapper for the `wo_a`
+  weight scale.
+
+Verified against the real kernel:
 
 ```
-SFA (8192, 8, 32) stride (1, 262144, 8192)   # vLLM's output — left untouched
-SFB (8, 1024, 32) stride (32768, 1, 1024)    # patched
+SFA (8192, 8, 32) stride (1, 262144, 8192)   # activation scales: already correct
+SFB (8, 1024, 32) stride (32768, 1, 1024)    # weight scales: patched
 rel err vs float reference: 2.0e-3
+value-identical to the unpatched packer (elementwise)
 ```
 
-> **Do not transpose SFA.** It is already correct. Transposing it moves the failure to
-> the `size(-3) == num_groups` assert and sends you down a blind alley.
+> **Do not transpose SFA.** The activation scales from
+> `fused_inv_rope_fp8_quant(tma_aligned_scales=True)` are already in the required
+> layout. Transposing them only moves the failure to the `size(-3) == num_groups`
+> assert and sends you down a blind alley.
 
-The relayout is a reinterpretation (no dtype change, no value change), so numerics are
-identical to a correctly packed tensor.
+The relayout is a reinterpretation — no dtype change, no value change — so numerics
+are identical to a correctly packed tensor. The load-time form costs nothing at
+inference; the `fp8_einsum` wrapper form is a ~1 MB × 40 layer per-forward copy, which
+is why the load-time fix is preferred where it applies.
 
-**This is a per-call copy.** `transpose.contiguous.transpose` runs inside `fp8_einsum` on
-every layer, every step — about 1 MB × 40 layers per forward, so cheap, but it is a
-runtime fix. The cleaner version is a one-shot repack of `wo_a.weight_scale` right after
-load (E8M0 → FP32 → DeepGEMM's own `get_mn_major_tma_aligned_packed_ue8m0_tensor`), which
-also drops any assumption about the byte order of whatever produced the K-major tensor.
-The 2.0e-3 rel-err below and the `17*19 → 323` check validate that assumption for this
-build, so the switch should be safe — it just has not been done here.
+The `fp8_einsum` wrapper form is a per-forward copy (~1 MB × 40 layers, cheap but
+redundant once the load-time fix is in place); it is kept because it also covers any
+producer that routes around `fp8_utils`.
 
 ### 2. `sparse_attn_indexer.py` — `cooperative_topk` has no SM103 cubin
 
@@ -141,29 +159,30 @@ Two flags differ from a naive SM90 port, and both are load-bearing:
 | `--block-size` | **128** | `models/deepseek_v4_1/sparse_mla.py:90` hardcodes `64 if family(90) else 128`. Passing 64 gives `ValueError: No common block size for 64`. |
 | `--gpu-memory-utilization` | **0.92** | 0.95 OOMs during load / graph capture. |
 | `--cpu-offload-gb` | **75** | see the sweep below. |
-| `--moe-backend` / `--linear-backend` | **marlin** | **required on this image** — see below. |
+| `--moe-backend` | **unset** | leave it on auto: the native `FLASHINFER_TRTLLM_MXFP4_MXFP8` path works once bug 1 is fixed (below). |
+| `--linear-backend` | **marlin** | FlashInfer CUTLASS rejects the offloaded weight strides; the dense projections are not the bottleneck. |
+| `VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS` | see compose | the TRT-LLM FP4 block-scale MoE autotune wedges on this build. |
 
-**Backends: both pinned to Marlin.** `--moe-backend marlin --linear-backend marlin` is what
-the config above runs. Neither pin is a device-support limitation and neither is
-permanent — they are two separate open items:
+### Backends: native MoE, Marlin only for the dense projections
 
-- **`DEEPGEMM_MXFP4`** (the auto-selected MoE backend) asserts inside
-  `m_grouped_fp8_fp4_gemm_nt_contiguous` on the 3-D expert scale tensor. In the
-  contiguous-grouped layout SFA is 2-D, so the `stride(-3)` check can only be firing on
-  SFB — the same check bug 1 trips, on a tensor produced at load by
-  `oracle/mxfp4.py::_pack_deepgemm_mxfp4_scales`. By analogy with bug 1 the fix should be
-  the same K-major → grouped MN-major relayout of those packed scales, but **I did not
-  probe or fix it** — treat that as expected, not established.
-  What it costs: prefill throughput. At ≤4 streams decode is weight-bandwidth-bound and
-  Marlin's dequant path is close to the native kernel; the number the native path would
-  move is the ~4.1K tok/s prefill figure, not the decode figure.
-- **FlashInfer CUTLASS MXFP8** (the auto-selected linear backend) fails
-  `Mismatched mB.strides[1]` — a stride rejection, not a device-capability one.
-  `MarlinMxfp8LinearKernel` accepts the same tensors, and these are the small dense
-  projections, so there is nothing to gain at this concurrency.
+The MoE runs on the native Blackwell path — auto-selects
+`FLASHINFER_TRTLLM_MXFP4_MXFP8` — because bug 1's relayout is applied at load time
+to every grouped scale tensor (see `patches/fp8_utils.py`). The attention `wo_a`
+BMM uses `DeepGemmMxfp8BmmLinearKernel`. Only the small dense projections stay on
+`MarlinMxfp8LinearKernel`, because FlashInfer CUTLASS fails
+`Mismatched mB.strides[1]` on the offloaded weight views — a stride rejection, not a
+device limitation, and nothing worth chasing at this concurrency.
 
-To try the native MoE path: put the bug-1 diagnostic on SFB inside `_grouped_fp4_impl`,
-apply the same relayout, drop `--moe-backend marlin`, re-run `verify.sh`.
+**The MoE autotune must be skipped.** With the native backend selected, vLLM runs a
+FlashInfer autotune over `trtllm_fp4_block_scale_moe` that never completes on this
+build — the engine pegs a core for 45+ minutes and writes zero autotune cache
+entries. The reference DGX-Spark deployment for this model skips the same op:
+
+```
+VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS="trtllm_fp4_block_scale_moe,flashinfer::trtllm_fp4_block_scale_moe"
+```
+
+With that set, boot completes in the usual ~7 minutes.
 
 ### CPU offload: the floor is structural
 
@@ -257,9 +276,10 @@ Standing on the shoulders of:
   `FLASHINFER_TRTLLM` NVFP4 MoE backend reports
   `does not support the deployment configuration since kernel does not support current
   device cuda` on SM103 in this build.
-- **Native `DEEPGEMM_MXFP4` experts**: blocked on the same layout bug class in
-  `_pack_deepgemm_mxfp4_scales`. Worth fixing for long-prompt prefill; irrelevant for
-  low-concurrency decode, where Marlin is fine.
+- **`DeepGemmMxfp8BmmLinearKernel.process_weights_after_loading` early-returns when
+  `weight.ndim == 3`**, so a 3-D `wo_a` weight never gets its scales repacked by that
+  kernel. This is why the `fp8_einsum` wrapper relayout is still needed alongside the
+  load-time fix.
 
 ## Open questions
 
@@ -272,13 +292,13 @@ Things I have not established, stated plainly so nobody builds on them:
   grep for exact-100 gates in the V4/V4.1 model, quantization and MoE-oracle trees found
   nothing. The gate is either elsewhere or the difference is in the packed-weight layout
   rather than the gate. Not located.
-- **Whether the MoE fix is really the same fix.** See the backend section — reasoned by
-  analogy, not tested. A reproducing test needs real `expert_ids` from
-  `deepgemm_moe_permute`; hand-built ones die earlier at `gemm.hpp:293 m == m__`.
-- **Whether SM103 has any path to the native kernels at all** without an image rebuild.
-  The `sm_100a` cubins are unusable here and no forward-compatible PTX is shipped, so the
-  only routes are a rebuild with `10.3a`/`compute_103` in the arch list, or staying on
-  Marlin.
+- **Why the TRT-LLM FP4 MoE autotune wedges.** It is skipped, not understood: the engine
+  pegs a core indefinitely and writes no autotune cache entries. The reference DGX-Spark
+  deployment skips the same op, which is why that workaround was tried.
+- **Whether a rebuild with `10.3a`/`compute_103` in `TORCH_CUDA_ARCH_LIST` would remove
+  the need for the `sparse_attn_indexer.py` patch.** Likely yes — the `sm_100a` cubins are
+  unusable on SM103 and no forward-compatible PTX is shipped — but that is untested and a
+  far heavier change than a five-line Python patch.
 
 ## License / usage notes
 

@@ -20,6 +20,7 @@ services:
       - "/tmp/deepseek-v4.1-flash:/tmp"
       - "/opt/ai-services/deepseek-v4.1-flash/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
       - "/opt/ai-services/deepseek-v4.1-flash/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/fp8_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py:ro"
       - "/opt/ai-services/deepseek-v4.1-flash/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
 
     deploy:
@@ -41,6 +42,7 @@ services:
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - VLLM_SLEEP_WHEN_IDLE=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS=trtllm_fp4_block_scale_moe,flashinfer::trtllm_fp4_block_scale_moe
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
@@ -73,8 +75,6 @@ services:
       - "--enable-auto-tool-choice"
       - "--reasoning-parser"
       - "deepseek_v41"
-      - "--moe-backend"
-      - "marlin"
       - "--linear-backend"
       - "marlin"
       - "--default-chat-template-kwargs.thinking=True"
@@ -83,7 +83,7 @@ services:
       - "--tokenizer-mode"
       - "deepseek_v41"
       - "--speculative-config"
-      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}'
       - "--served-model-name"
       - "deepseek-v4.1-flash"
       - "--host"
