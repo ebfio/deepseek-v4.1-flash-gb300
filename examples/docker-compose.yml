@@ -1,0 +1,114 @@
+services:
+  deepseek-v4.1-flash:
+    image: vllm/vllm-openai:deepseekv41-flash-0909-cu129-arm64
+    container_name: "vllm-deepseek-v4.1-flash"
+    restart: no #unless-stopped
+
+    dns:
+      - 10.0.0.1
+      - 8.8.8.8
+
+    ports:
+      - "8001:8001"
+
+    volumes:
+      - "/models:/models:ro"
+      - "/models/huggingface-cache:/root/.cache/huggingface"
+      - "/models/vllm-cache:/root/.cache/vllm"          # torch.compile + inductor cache
+      - "/models/flashinfer-cache:/root/.cache/flashinfer"  # FlashInfer JIT kernel cache
+      - "/models/deep-gemm-cache:/root/.deep_gemm"          # DeepGEMM JIT cache (sm_103a)
+      - "/tmp/deepseek-v4.1-flash:/tmp"
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['GPU-78b03329-6cb3-554c-0c47-02082547b499']
+              capabilities: [gpu]
+
+
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_MODULE_LOADING=LAZY
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_SLEEP_WHEN_IDLE=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+    command:
+      - "--model"
+      - "deepseek-ai/DeepSeek-V4.1-Flash"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--gpu-memory-utilization"
+      - "0.92"
+      #- "--max-model-len"
+      #- "1048576"
+      - "--dtype"
+      - "auto"
+      - "--compilation-config"
+      - '{"mode": 3, "cudagraph_capture_sizes":[1,6,12,18,24]}'
+      - "--cpu-offload-gb"
+      - "75"
+      - "--enable-prefix-caching"  # Automatic KV cache optimization
+      - "--enable-chunked-prefill"  # Process long prompts in chunks
+      - "--max-num-seqs"
+      - "4"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--trust-remote-code"
+      - "--tool-call-parser"
+      - "deepseek_v41"
+      - "--enable-auto-tool-choice"
+      - "--reasoning-parser"
+      - "deepseek_v41"
+      - "--moe-backend"
+      - "marlin"
+      - "--linear-backend"
+      - "marlin"
+      - "--default-chat-template-kwargs.thinking=True"
+      - "--block-size"
+      - "128"
+      - "--tokenizer-mode"
+      - "deepseek_v41"
+      - "--speculative-config"
+      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+      - "--served-model-name"
+      - "deepseek-v4.1-flash"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8001"
+
+    ipc: host
+    init: true
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+
+    #mem_limit: 64g
+    #cpus: 8
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 1200s
+
