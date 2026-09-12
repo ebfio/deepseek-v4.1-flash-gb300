@@ -30,8 +30,11 @@ failure modes.
 ```
 patches/
   deep_gemm.py             # attention o_proj weight-scale layout (DeepGEMM einsum)
+  fp8_utils.py             # load-time SFB scale relayout for grouped UE8M0 scales
   sparse_attn_indexer.py   # cooperative_topk has no SM103 cubin
   o_proj.py                # one-shot layout diagnostic (drop-safe)
+  deepseek_v41.py          # DSML tool-call recovery (streaming-safe)
+  deepseek_v4.py           # orphan-invoke transition the v41 parser inherits
 examples/
   docker-compose.yml       # working config, all values measured
   verify.sh                # math / long-context / tool-calling checks
@@ -57,11 +60,14 @@ runs at **~14 tok/s**. Same model, **~6.5×** faster on the Station.
 Reproduce the numbers with `examples/verify.sh` (tests correctness, not speed — a
 wrong-but-legal scale layout produces garbage text, never an assert).
 
-## The three bugs
+## The bugs
 
-All three are the same shape of problem: vLLM's Blackwell code paths hand DeepGEMM
+Bugs 1-3 are the same shape of problem: vLLM's Blackwell code paths hand DeepGEMM
 grouped scale tensors in a layout its kernels reject. Bug 1 is fixed at the **load-time
 producer** so the fix covers every consumer at once.
+
+Bug 4 is unrelated to the GPU: a parser that cannot recover from malformed tool-call
+markup. It is listed here because it makes an agent-driven deployment unusable.
 
 ### 1. grouped UE8M0 scale layout — `fp8_utils.py` + `deep_gemm.py`
 
@@ -150,17 +156,60 @@ covers the same conditions and works on SM103.
 
 Prints the (shape, stride) of both scale tensors **once per process**. Safe to delete.
 
+### 4. `deepseek_v41.py` + `deepseek_v4.py` — tool-call markup recovery
+
+This one is **not** an SM103 problem — it would fire on any arch. It is included because an
+agent-driven deployment is unusable without it, and it was found in production here.
+
+vLLM's V4.1 DSML parser is a strict state machine with **no recovery**. When the model emits
+malformed tool-call markup, the parser leaks the raw markup into `content` and drops the
+call — so the caller sees prose where a tool invocation was intended, and the failure is
+silent (HTTP 200, `finish_reason: stop`, zero `tool_calls`). DeepSeek's own reference parser
+documents that the model "might occasionally generate" malformed output and explicitly
+declines to recover, telling callers to add their own error handling.
+
+Shapes observed in production, all now recovered:
+
+| shape | what the model emitted |
+|---|---|
+| unspaced V4 tags | V4 spelling where V4.1 expects a space before `calls`/`invoke`/`parameter` |
+| missing invoke wrapper | tool name in a bare selector line; no invoke tag |
+| orphan invoke | the opening `calls` tag omitted entirely |
+| sigilless openers, sigil-bearing closer | openers lost their sigil while the closer kept it |
+| plain-ASCII wrapper tags | whole block degraded to plain tags, no sigil anywhere |
+| inline closer | closer written at the end of the value line, sometimes with EOS glued on (`...closer<EOS>`) |
+| malformed parameter closer | value regex must stop at any marker-like tail (vLLM #56302) |
+
+The fix is a **rolling-buffer repair** in `_preprocess_feed`, not a per-delta regex: the
+server streams a few tokens at a time, so a pattern like a bare parameter line followed by
+a marker never lands in a single delta. A plain `re.sub` on `delta_text` matches nothing in
+production while passing any test that feeds the block as one chunk. The repair therefore
+holds back an unresolved marker prefix and emits only once the block is whole.
+
+**Tolerance, not prevention.** The recovery converts an unparseable emission into the call
+the model intended; it does not stop the model from misspelling. A clean refusal (zero
+calls, zero markup) is not a failure and must not be counted as one.
+
+Validation is a 15-case engine suite at `step=1` (token-by-token, what the server actually
+streams) and `step=4`, plus leak-focused live probes. Any production leak gets a new case
+added first, reproduced at `step=1`, then fixed.
+
+Verified A/B on captured production payloads: unpatched returns 0 calls with markup in
+content; patched returns the intended call.
+
 ## Launch config notes
 
-Two flags differ from a naive SM90 port, and both are load-bearing:
+Several flags differ from a naive SM90 port, and all are load-bearing:
 
 | flag | value | why |
 |---|---|---|
 | `--block-size` | **128** | `models/deepseek_v4_1/sparse_mla.py:90` hardcodes `64 if family(90) else 128`. Passing 64 gives `ValueError: No common block size for 64`. |
 | `--gpu-memory-utilization` | **0.92** | 0.95 OOMs during load / graph capture. |
 | `--cpu-offload-gb` | **75** | see the sweep below. |
+| `--max-model-len` | **1048576** | required for 1M context; without it the default caps the window far below the model's capability. |
 | `--moe-backend` | **unset** | leave it on auto: the native `FLASHINFER_TRTLLM_MXFP4_MXFP8` path works once bug 1 is fixed (below). |
 | `--linear-backend` | **marlin** | FlashInfer CUTLASS rejects the offloaded weight strides; the dense projections are not the bottleneck. |
+| `--speculative-config` | `dspark`, 5 tokens, **probabilistic** | `draft_sample_method: probabilistic`; `greedy` was an earlier value and is not what this config runs. |
 | `VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS` | see compose | the TRT-LLM FP4 block-scale MoE autotune wedges on this build. |
 
 ### Backends: native MoE, Marlin only for the dense projections
@@ -218,14 +267,22 @@ cd /opt/ai-services/deepseek-v4.1-flash
 docker compose up -d
 ```
 
-The three mounts to add to an existing compose file:
+The six mounts to add to an existing compose file (all six are required — the patch set is
+all-or-nothing for the SM103 config described here):
 
 ```yaml
 volumes:
-  - "…/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
+  - "…/patches/fp8_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py:ro"
   - "…/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
   - "…/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
+  - "…/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
+  - "…/patches/deepseek_v4.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v4.py:ro"
+  - "…/patches/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v41.py:ro"
 ```
+
+A changed patch needs a **recreate**, not a restart: bind mounts resolve at container start,
+so a restarted container keeps running the old file. Use `docker compose up -d --force-recreate`.
+(Note that a plain `docker restart` does not re-read compose env or args either.)
 
 ## Verifying a deploy
 
@@ -239,7 +296,14 @@ curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -
 ```
 
 A wrong-but-legal scale layout produces **garbage text, not an assert** — always run a
-correctness check, never just a health check.
+correctness check, never just a health check. `examples/verify.sh` covers all three:
+math, long-context needle retrieval, and tool calling.
+
+Tool calling deserves its own note: a malformed emission does **not** return an error. It
+returns HTTP 200 with `finish_reason: stop` and zero `tool_calls`, with the raw markup
+sitting in `content`. So check for the call, not for a 200. If `tool_calls` is empty, dump
+`content` and look for markup — that is the signature of the parser bug (bug 4), and it is
+what the recovery patches fix. A clean refusal (zero calls, zero markup) is not a failure.
 
 ## Tested environment
 

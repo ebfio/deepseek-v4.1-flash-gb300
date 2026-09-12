@@ -37,4 +37,27 @@ tc=m.get("tool_calls")
 if not tc: print("   FAIL: no tool_calls (raw markup leaked?)", repr(m.get("content"))[:120]); sys.exit(1)
 print("   tool:", tc[0]["function"]["name"], tc[0]["function"]["arguments"]); print("   PASS")'
 
+echo "== tool-call recovery (malformed-emission guard) =="
+# The parser bug is SILENT: HTTP 200, finish_reason "stop", zero tool_calls,
+# raw markup left in content. So assert on the call and on the absence of
+# markup, not on the status code. A clean refusal (no call, no markup) is not
+# a failure -- only markup reaching content is.
+curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\":\"$MODEL\",\"tool_choice\":\"auto\",\"max_tokens\":200,\
+  \"temperature\":0,\"chat_template_kwargs\":{\"thinking\":false},\
+  \"messages\":[{\"role\":\"user\",\"content\":\"List the files in /tmp. Use a tool.\"}],\
+  \"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"run\",\
+    \"description\":\"Run a shell command\",\
+    \"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\
+\"required\":[\"command\"]}}}]}" \
+| python3 -c '
+import json,sys
+m=json.load(sys.stdin)["choices"][0]["message"]
+c=m.get("content") or ""
+tc=m.get("tool_calls") or []
+leak=("DSML" in c) or ("tool_calls" in c) or ("parameter name=" in c) or ("invoke name=" in c)
+if leak: print("   FAIL: raw tool-call markup leaked into content"); sys.exit(1)
+if not tc: print("   SKIP: clean refusal (no call, no markup) -- not a failure"); sys.exit(0)
+print("   tool:", tc[0]["function"]["name"], tc[0]["function"]["arguments"][:60]); print("   PASS")'
+
 echo; echo "all checks passed"

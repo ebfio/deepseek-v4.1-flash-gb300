@@ -22,6 +22,13 @@ services:
       - "/opt/ai-services/deepseek-v4.1-flash/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
       - "/opt/ai-services/deepseek-v4.1-flash/patches/fp8_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py:ro"
       - "/opt/ai-services/deepseek-v4.1-flash/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
+      # Tool-call recovery (see patches/deepseek_v41.py + patches/deepseek_v4.py).
+      # vLLM's V4.1 DSML parser is a strict state machine with no recovery: a
+      # malformed emission leaks raw markup into content and drops the call.
+      # deepseek_v41.py monkeypatches _preprocess_feed to repair the shapes the
+      # model actually emits; deepseek_v4.py adds the orphan-invoke transition.
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/deepseek_v4.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v4.py:ro"
+      - "/opt/ai-services/deepseek-v4.1-flash/patches/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v41.py:ro"
 
     deploy:
       resources:
@@ -46,6 +53,8 @@ services:
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
+      - VLLM_DEEP_GEMM_WARMUP=skip
+      - VLLM_ENGINE_READY_TIMEOUT_S=3600
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
     command:
@@ -55,8 +64,8 @@ services:
       - "1"
       - "--gpu-memory-utilization"
       - "0.92"
-      #- "--max-model-len"
-      #- "1048576"
+      - "--max-model-len"
+      - "1048576"
       - "--dtype"
       - "auto"
       - "--compilation-config"
@@ -83,7 +92,7 @@ services:
       - "--tokenizer-mode"
       - "deepseek_v41"
       - "--speculative-config"
-      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}'
+      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
       - "--served-model-name"
       - "deepseek-v4.1-flash"
       - "--host"
