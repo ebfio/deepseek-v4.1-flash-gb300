@@ -1,75 +1,31 @@
-# DeepSeek-V4.1-Flash on DGX Station GB300 (SM103) — patches for the official vLLM image
+# DeepSeek-V4.1-Flash on DGX Station GB300 (SM103) — one patch for the official vLLM nightly
 
 Run **DeepSeek-V4.1-Flash** (522B MoE / 8-16B active) on an **NVIDIA DGX Station GB300**
-with the official `vllm/vllm-openai:deepseekv41-flash-*` image.
+with the official `vllm/vllm-openai:nightly` image — plus exactly **one** bind-mounted
+patch.
+
+> **Nightly, not the launch tag.** Any nightly from 2026-09-10 on serves this model
+> natively ([vllm-project/vllm#56228](https://github.com/vllm-project/vllm/pull/56228));
+> the official recipe has deprecated the launch-day `deepseekv41-flash-0909` tag. On the
+> 0909 image this repo used to ship **six** patches. Five of them are now dead overlays
+> that would *revert* newer upstream code — only the DeepGEMM scale-layout fix survives,
+> because that bug is still live upstream.
 
 Companion to [ebfio/glm53-flash-dflash2-gb300](https://github.com/ebfio/glm53-flash-dflash2-gb300)
 — same class of machine, same "make the upstream image work on this GPU" problem, different
 failure modes.
 
-> **SM103, not SM100.** nvidia-smi reports `compute_cap 10.3` on this box. The upstream
-> image builds `TORCH_CUDA_ARCH_LIST="8.7 8.9 9.0 10.0+PTX 12.0"`, and inspection of the
-> shipped `_C_stable_libtorch` shows what that actually produced:
->
-> ```
-> CUBINs: sm_80, sm_87, sm_89, sm_90, sm_90a, sm_100, sm_100a, sm_120, sm_120a
-> PTX:    sm_80, sm_89, sm_90        ← no sm_100/sm_103 PTX, nothing JITs forward
-> ```
->
-> So there **is** SM100 code (`sm_100` and the arch-specific `sm_100a`), and **no**
-> `sm_100`/`compute_100` PTX — which means nothing JIT-compiles forward onto 10.3. The
-> `sm_100a` cubins are the sharp edge: an `a`-suffixed cubin runs on *exactly* its target
-> arch and never on a later one, so SM103 silently has no image for those kernels.
->
-> That explains **bug 2 below only**. Bugs 1 and 3 are host-side Python layout problems —
-> no kernel is involved, and they would fire on any arch whose code path reaches them.
-> They are not SM103-specific in principle; they are SM103-specific *in practice* here
-> because of which arch gates select those paths, and I have not located the exact gate
-> that makes them fire on 10.3 but not on 10.0. See the caveat at the end.
-
 ```
 patches/
-  deep_gemm.py             # attention o_proj weight-scale layout (DeepGEMM einsum)
-  fp8_utils.py             # load-time SFB scale relayout for grouped UE8M0 scales
-  sparse_attn_indexer.py   # cooperative_topk has no SM103 cubin
-  o_proj.py                # one-shot layout diagnostic (drop-safe)
-  deepseek_v41.py          # DSML tool-call recovery (streaming-safe)
-  deepseek_v4.py           # orphan-invoke transition the v41 parser inherits
+  deep_gemm.py             # grouped UE8M0 scale layout (the one live bug)
 examples/
   docker-compose.yml       # working config, all values measured
-  verify.sh                # math / long-context / tool-calling checks
+  verify.sh                # math / long-context / tool-calling / vision checks
 ```
 
-## Results
+## The bug
 
-DGX Station GB300, single GPU, `--tensor-parallel-size 1`, thinking off:
-
-| metric | value |
-|---|---|
-| decode (technical prose) | **91.7 tok/s** median of 4 |
-| decode (essay) | 57.8 tok/s |
-| prefill (9K-token prompt) | **~4,090 tok/s** (2.2 s wall) |
-| KV cache | 4,458,466 tokens (9.36 GiB) |
-| concurrency @ 1M ctx | 4.25× |
-| correctness | `17*19 → 323`; needle-in-9K retrieved exactly |
-| tool calling | clean `tool_calls`, `finish_reason=tool_calls` |
-
-For reference, the same checkpoint on a GH200 (SM90, MARLIN, `--cpu-offload-gb 210`)
-runs at **~14 tok/s**. Same model, **~6.5×** faster on the Station.
-
-Reproduce the numbers with `examples/verify.sh` (tests correctness, not speed — a
-wrong-but-legal scale layout produces garbage text, never an assert).
-
-## The bugs
-
-Bugs 1-3 are the same shape of problem: vLLM's Blackwell code paths hand DeepGEMM
-grouped scale tensors in a layout its kernels reject. Bug 1 is fixed at the **load-time
-producer** so the fix covers every consumer at once.
-
-Bug 4 is unrelated to the GPU: a parser that cannot recover from malformed tool-call
-markup. It is listed here because it makes an agent-driven deployment unusable.
-
-### 1. grouped UE8M0 scale layout — `fp8_utils.py` + `deep_gemm.py`
+### grouped UE8M0 scale layout — `deep_gemm.py`
 
 DeepGEMM validates grouped scale tensors in `csrc/utils/layout.hpp::check_sf_layout`:
 
@@ -82,120 +38,55 @@ if (num_groups.has_value())
 ```
 
 vLLM's load-time packer emits the packed int32 UE8M0 tensor **row-major**, so
-`stride(-2) != 1` and the first grouped kernel to touch it dies:
+`stride(-2) != 1` and the first grouped kernel to touch it dies. This defect predates
+nightly (it is what two of the old 0909 patches worked around) — and nightly reaches it
+through a **new** path: the `flash_mla_mega_attn` attention backend's `o_proj` calls
+`fp8_einsum` with the load-time scale tensor during `profile_run`, so a clean boot dies
+before the server ever comes up:
 
 ```
-RuntimeError: Assertion error (csrc/utils/layout.hpp:113):
+RuntimeError: Assertion error (/workspace/.deps/deepgemm-src/.../utils/layout.hpp:119):
   sf.stride(-3) == sf.stride(-1) * sf.size(-1)
+  (in vllm/utils/deep_gemm.py fp8_einsum, called from
+   vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py _o_proj)
 ```
 
-This single defect blocks **both** the attention `o_proj` (`fp8_einsum`) and the MoE
-expert scales — the same producer,
-`deepgemm_post_process_weight_scale_block`, feeds both.
+**Fix** (`patches/deep_gemm.py`, ported onto nightly's own file — not a copy of the old
+patch): a `_dg_fix_grouped_sf()` helper applied in two places —
 
-Fix, in two places:
+1. inside the `fp8_einsum` wrapper, for grouped `(scale, weight)` operand pairs (covers
+   the mega-attention `o_proj` and any other direct caller);
+2. on the result of `transform_sf_into_required_layout`, the choke point every load-time
+   scale producer routes through (covers the MoE expert scales).
 
-- **`patches/fp8_utils.py`** relayouts at load, inside
-  `deepgemm_post_process_weight_scale_block`, padding `mn` to a multiple of 4 so the
-  TMA-aligned-stride check holds for shapes where `mn % 4 != 0`. This is what unblocks
-  the native MoE path.
-- **`patches/deep_gemm.py`** relayouts the result of
-  `transform_sf_into_required_layout` — the choke point every producer routes through,
-  including the direct callers in `models/deepseek_v4/nvidia/model.py` that bypass
-  `fp8_utils` — and keeps a relayout inside the `fp8_einsum` wrapper for the `wo_a`
-  weight scale.
-
-Verified against the real kernel:
-
-```
-SFA (8192, 8, 32) stride (1, 262144, 8192)   # activation scales: already correct
-SFB (8, 1024, 32) stride (32768, 1, 1024)    # weight scales: patched
-rel err vs float reference: 2.0e-3
-value-identical to the unpatched packer (elementwise)
-```
+The relayout is a reinterpretation — `sf.transpose(-1,-2).contiguous().transpose(-1,-2)`,
+no dtype or value change — verified value-preserving and idempotent on nightly's own
+torch, and boot-proven on the real checkpoint.
 
 > **Do not transpose SFA.** The activation scales from
-> `fused_inv_rope_fp8_quant(tma_aligned_scales=True)` are already in the required
-> layout. Transposing them only moves the failure to the `size(-3) == num_groups`
-> assert and sends you down a blind alley.
+> `fused_inv_rope_fp8_quant(tma_aligned_scales=True)` are already in the required layout.
+> Transposing them moves the failure to the `size(-3) == num_groups` assert and sends you
+> down a blind alley. The patch checks the stride predicate and passes valid tensors
+> through untouched.
 
-The relayout is a reinterpretation — no dtype change, no value change — so numerics
-are identical to a correctly packed tensor. The load-time form costs nothing at
-inference; the `fp8_einsum` wrapper form is a ~1 MB × 40 layer per-forward copy, which
-is why the load-time fix is preferred where it applies.
+A wrong-but-legal scale layout produces **garbage text, not an assert** — if you change
+anything in this area, rerun the correctness checks below, never just a health check.
 
-The `fp8_einsum` wrapper form is a per-forward copy (~1 MB × 40 layers, cheap but
-redundant once the load-time fix is in place); it is kept because it also covers any
-producer that routes around `fp8_utils`.
+## The thinking-flag trap
 
-### 2. `sparse_attn_indexer.py` — `cooperative_topk` has no SM103 cubin
+The V4.1 chat template defaults to **thinking ON at effort 50** when no keys are sent.
+Two consequences:
 
-```python
-use_cooperative_topk = (
-    current_platform.is_cuda()
-    and topk_tokens in (512, 1024, 2048)
-    and num_rows <= 64
-    and logits.stride(0) % 4 == 0
-    and current_platform.has_device_capability(90)     # ← admits SM103
-    and not current_platform.is_device_capability_family(120)
-)
-```
+- `--default-chat-template-kwargs.thinking=True` on the serve line is redundant **and
+  harmful**: clients that don't override it pay the reasoning tax on every request —
+  image assessments that should take seconds take minutes, and small-`max_tokens`
+  requests burn their whole budget on the trace and return empty `content` with
+  `finish_reason: length`, which reads as a broken model and is not.
+- The fix is per-call control: `chat_template_kwargs: {"thinking": false}` when you
+  want a plain answer, or `reasoning_effort` (`low|high|xhigh|max`, or an integer
+  1–100) when you want reasoning.
 
-The gate passes on SM103, but the prebuilt kernel does not exist for it, so **CUDA graph
-capture** dies:
-
-```
-RuntimeError: launch_cooperative_cluster, cooperative_topk.cu:48,
-  cooperative_topk launch failed: no kernel image is available for execution on the device
-```
-
-Fix: narrow the gate to the SM90 family. The existing `persistent_topk` fallback below it
-covers the same conditions and works on SM103.
-
-### 3. `o_proj.py` — diagnostic only
-
-Prints the (shape, stride) of both scale tensors **once per process**. Safe to delete.
-
-### 4. `deepseek_v41.py` + `deepseek_v4.py` — tool-call markup recovery
-
-This one is **not** an SM103 problem — it would fire on any arch. It is included because an
-agent-driven deployment is unusable without it, and it was found in production here.
-
-vLLM's V4.1 DSML parser is a strict state machine with **no recovery**. When the model emits
-malformed tool-call markup, the parser leaks the raw markup into `content` and drops the
-call — so the caller sees prose where a tool invocation was intended, and the failure is
-silent (HTTP 200, `finish_reason: stop`, zero `tool_calls`). DeepSeek's own reference parser
-documents that the model "might occasionally generate" malformed output and explicitly
-declines to recover, telling callers to add their own error handling.
-
-Shapes observed in production, all now recovered:
-
-| shape | what the model emitted |
-|---|---|
-| unspaced V4 tags | V4 spelling where V4.1 expects a space before `calls`/`invoke`/`parameter` |
-| missing invoke wrapper | tool name in a bare selector line; no invoke tag |
-| orphan invoke | the opening `calls` tag omitted entirely |
-| sigilless openers, sigil-bearing closer | openers lost their sigil while the closer kept it |
-| plain-ASCII wrapper tags | whole block degraded to plain tags, no sigil anywhere |
-| inline closer | closer written at the end of the value line, sometimes with EOS glued on (`...closer<EOS>`) |
-| malformed parameter closer | value regex must stop at any marker-like tail (vLLM #56302) |
-
-The fix is a **rolling-buffer repair** in `_preprocess_feed`, not a per-delta regex: the
-server streams a few tokens at a time, so a pattern like a bare parameter line followed by
-a marker never lands in a single delta. A plain `re.sub` on `delta_text` matches nothing in
-production while passing any test that feeds the block as one chunk. The repair therefore
-holds back an unresolved marker prefix and emits only once the block is whole.
-
-**Tolerance, not prevention.** The recovery converts an unparseable emission into the call
-the model intended; it does not stop the model from misspelling. A clean refusal (zero
-calls, zero markup) is not a failure and must not be counted as one.
-
-Validation is a 15-case engine suite at `step=1` (token-by-token, what the server actually
-streams) and `step=4`, plus leak-focused live probes. Any production leak gets a new case
-added first, reproduced at `step=1`, then fixed.
-
-Verified A/B on captured production payloads: unpatched returns 0 calls with markup in
-content; patched returns the intended call.
+The compose file in this repo does **not** set the server-side flag.
 
 ## Launch config notes
 
@@ -203,40 +94,19 @@ Several flags differ from a naive SM90 port, and all are load-bearing:
 
 | flag | value | why |
 |---|---|---|
-| `--block-size` | **128** | `models/deepseek_v4_1/sparse_mla.py:90` hardcodes `64 if family(90) else 128`. Passing 64 gives `ValueError: No common block size for 64`. |
+| `--block-size` | **128** | `models/deepseek_v41/sparse_mla.py:90` hardcodes `64 if family(90) else 128`. Passing 64 gives `ValueError: No common block size for 64`. |
 | `--gpu-memory-utilization` | **0.92** | 0.95 OOMs during load / graph capture. |
 | `--cpu-offload-gb` | **75** | see the sweep below. |
-| `--max-model-len` | **1048576** | required for 1M context; without it the default caps the window far below the model's capability. |
-| `--moe-backend` | **unset** | leave it on auto: the native `FLASHINFER_TRTLLM_MXFP4_MXFP8` path works once bug 1 is fixed (below). |
-| `--linear-backend` | **marlin** | FlashInfer CUTLASS rejects the offloaded weight strides; the dense projections are not the bottleneck. |
-| `--speculative-config` | `dspark`, 5 tokens, **probabilistic** | `draft_sample_method: probabilistic`; `greedy` was an earlier value and is not what this config runs. |
-| `VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS` | see compose | the TRT-LLM FP4 block-scale MoE autotune wedges on this build. |
-
-### Backends: native MoE, Marlin only for the dense projections
-
-The MoE runs on the native Blackwell path — auto-selects
-`FLASHINFER_TRTLLM_MXFP4_MXFP8` — because bug 1's relayout is applied at load time
-to every grouped scale tensor (see `patches/fp8_utils.py`). The attention `wo_a`
-BMM uses `DeepGemmMxfp8BmmLinearKernel`. Only the small dense projections stay on
-`MarlinMxfp8LinearKernel`, because FlashInfer CUTLASS fails
-`Mismatched mB.strides[1]` on the offloaded weight views — a stride rejection, not a
-device limitation, and nothing worth chasing at this concurrency.
-
-**The MoE autotune must be skipped.** With the native backend selected, vLLM runs a
-FlashInfer autotune over `trtllm_fp4_block_scale_moe` that never completes on this
-build — the engine pegs a core for 45+ minutes and writes zero autotune cache
-entries. The reference DGX-Spark deployment for this model skips the same op:
-
-```
-VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS="trtllm_fp4_block_scale_moe,flashinfer::trtllm_fp4_block_scale_moe"
-```
-
-With that set, boot completes in the usual ~7 minutes.
+| `--max-model-len` | **1048576** | required for 1M context. |
+| `--linear-backend` | **marlin** | FlashInfer CUTLASS rejects the offloaded weight strides; the dense projections are not the bottleneck. Attention runs the native `flash_mla_mega_attn` path regardless of this flag — the marlin pin only governs the dense projections, and it does **not** protect against the DeepGEMM assert (the crash is in the attention einsum). |
+| `--speculative-config` | `dspark`, 5 tokens, **probabilistic** | `draft_sample_method: probabilistic`. |
+| `--tokenizer-mode` / parsers | `deepseek_v41` | V4.1 DSML dialect; the `deepseek_v4` parser leaks raw markup into content. |
 
 ### CPU offload: the floor is structural
 
-Non-Engram weights total **287.7 GiB**; the HBM budget at `gmu 0.92` is **230.6 GiB**.
-At least **57 GiB must be offloaded** no matter how you configure it. Measured sweep:
+Non-Engram weights total **~288 GiB**; the HBM budget at `gmu 0.92` is ~230 GiB. At least
+~57 GiB must be offloaded no matter how you configure it. Measured sweep (on the 0909
+image; the floor is architectural and carries over):
 
 | `--cpu-offload-gb` | KV cache | concurrency @1M |
 |---|---|---|
@@ -244,133 +114,134 @@ At least **57 GiB must be offloaded** no matter how you configure it. Measured s
 | **75** | **4.46M tok** | **4.25×** |
 | 70 | 1.26M tok | 1.20× |
 
-**75 is the choice for KV headroom**: it keeps 4.25× concurrency at 1M context while
-still pulling 15 GiB of experts back into HBM versus 90. Below 75 the pool collapses
-(1.20× at 70), which is a capacity problem for a shared endpoint, not a speed one.
+**75 keeps 4.25× concurrency at 1M context** while pulling ~15 GiB of experts back into
+HBM versus 90. Below 75 the pool collapses — a capacity problem for a shared endpoint,
+not a speed one. On nightly the same 75 yields an even larger pool (below) thanks to the
+`nvfp4_ds_mla` KV format.
 
-> A note on the decode column this table used to carry: single-stream decode does not
-depend on KV pool size, so the 91.7 vs 79.9 tok/s I first reported here was measuring
-> DSpark acceptance on two different prompts, not the effect of the offload change.
-> Acceptance varies a lot with prompt predictability, which makes single-sample tok/s a
-> poor instrument for config decisions. The offload choice above rests on the KV numbers;
-> if you want the speed column to mean something, fix one prompt, temperature 0, take ≥5
-> reps, and record mean accepted length alongside tok/s.
+> Single-stream decode does not depend on KV pool size, so decode numbers are a poor
+> instrument for offload decisions — acceptance varies with prompt predictability. The
+> offload choice above rests on the KV numbers. If you want decode numbers to mean
+> anything: fix one prompt, temperature 0, ≥5 reps, record mean accepted length alongside
+> tok/s.
+
+## Results
+
+DGX Station GB300, single GPU, `--tensor-parallel-size 1`, thinking off:
+
+| metric | 0909 image (six patches) | **nightly (this repo)** |
+|---|---|---|
+| KV cache | 4,458,466 tokens (9.36 GiB) | **6,845,219 tokens (6.53× @ 1M ctx)** |
+| attention path | pre-mega | **native `flash_mla_mega_attn`** |
+| decode (code, warm) | 91.7 tok/s | ~91.5 tok/s |
+| correctness | `17*19 → 323` | `17*19 → 323` |
+| vision | untested | 1×1 image → correct short description |
+| tool calling | via recovery patches | upstream rewritten parser; smoke-tested clean |
+
+Boot: weights 48/48 shards in ~90 s, DSpark draft load, CUDA graph capture 3 s,
+health 200 at ~14 min (first nightly boot JIT-compiles kernels).
+
+Reproduce correctness with `examples/verify.sh` (tests math, long-context needle
+retrieval, tool calling, and vision — a wrong-but-legal scale layout produces garbage
+text, never an assert).
+
+For reference, the same checkpoint on a GH200 (SM90, MARLIN, `--cpu-offload-gb 210`)
+runs at **~14 tok/s**. Same model, **~6.5×** faster on the Station.
 
 ## Usage
 
 ```bash
-# 1. copy the patches somewhere on the host
-install -D -m 0644 patches/*.py /opt/ai-services/deepseek-v4.1-flash/patches/
+# 1. clone the repo somewhere stable on the host (paths in the compose are absolute)
+git clone https://github.com/ebfio/deepseek-v4.1-flash-gb300 /opt/deepseek-v4.1-flash-gb300
 
-# 2. start the service (see examples/docker-compose.yml for the full config)
-cd /opt/ai-services/deepseek-v4.1-flash
-docker compose up -d
+# 2. edit examples/docker-compose.yml: set your GB300 UUID and cache paths, then
+docker compose -f examples/docker-compose.yml up -d
 ```
 
-The six mounts to add to an existing compose file (all six are required — the patch set is
-all-or-nothing for the SM103 config described here):
+The single mount (adjust the left side to your checkout):
 
 ```yaml
 volumes:
-  - "…/patches/fp8_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py:ro"
-  - "…/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
-  - "…/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
-  - "…/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
-  - "…/patches/deepseek_v4.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v4.py:ro"
-  - "…/patches/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v41.py:ro"
+  - "/opt/deepseek-v4.1-flash-gb300/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
 ```
 
-A changed patch needs a **recreate**, not a restart: bind mounts resolve at container start,
-so a restarted container keeps running the old file. Use `docker compose up -d --force-recreate`.
-(Note that a plain `docker restart` does not re-read compose env or args either.)
+A changed patch needs a **recreate**, not a restart: bind mounts resolve at container
+start, so a restarted container keeps running the old file. Use
+`docker compose up -d --force-recreate`.
 
 ## Verifying a deploy
 
 ```bash
-curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "deepseek-v4.1-flash",
-  "messages": [{"role": "user", "content": "What is 17*19? Return only the integer."}],
-  "max_tokens": 32, "temperature": 0,
-  "chat_template_kwargs": {"thinking": false}}'
-# expect content "323"
+bash examples/verify.sh http://127.0.0.1:8001
 ```
 
-A wrong-but-legal scale layout produces **garbage text, not an assert** — always run a
-correctness check, never just a health check. `examples/verify.sh` covers all three:
-math, long-context needle retrieval, and tool calling.
+Covers math (`323`), long-context needle retrieval, tool calling, and vision. Tool
+calling deserves its own note: a malformed emission does **not** return an error — HTTP
+200, `finish_reason: stop`, zero `tool_calls`, raw markup in `content`. Check for the
+call, not for a 200. A clean refusal (zero calls, zero markup) is not a failure.
 
-Tool calling deserves its own note: a malformed emission does **not** return an error. It
-returns HTTP 200 with `finish_reason: stop` and zero `tool_calls`, with the raw markup
-sitting in `content`. So check for the call, not for a 200. If `tool_calls` is empty, dump
-`content` and look for markup — that is the signature of the parser bug (bug 4), and it is
-what the recovery patches fix. A clean refusal (zero calls, zero markup) is not a failure.
+## Tool-call markup recovery — history, and a caveat
+
+On the 0909 image, this repo shipped a rolling-buffer DSML repair
+(`deepseek_v41.py` + `deepseek_v4.py`, seven malformed-emission shapes recovered,
+15-case engine suite at step=1). Nightly **rewrote** the V4.1 parser wholesale (the
+module is now a thin ~54-line file), so those patches are dead code against it and have
+been removed.
+
+What that means practically: on nightly, tool-call parsing rides upstream's rewritten
+parser. Basic tool-calling and malformed-markup smoke tests pass — but the full
+15-shape production suite has **not** been re-run against the new parser, so if you run
+an agent-driven workload and a `tool_calls` entry silently turns into prose with markup
+in `content`, the parser is the first suspect. The shapes to look for are documented in
+this repo's git history (see the `2b6a366` and `8d6c6c0` commits).
+
+## What died with the 0909 patches (and why)
+
+For anyone running the deprecated launch tag, the old README documented five further
+patches; they are **not** needed on nightly and mounting them there would overwrite
+newer upstream code:
+
+| old patch | why it existed (0909) | status on nightly |
+|---|---|---|
+| `sparse_attn_indexer.py` | `cooperative_topk` had no SM103 cubin; gate narrowed to SM90 family | `use_cooperative_topk` deleted upstream — patch is dead code |
+| `o_proj.py` | layout diagnostic logging | path no longer exists (`models/deepseek_v41/` was restructured) |
+| `fp8_utils.py` | load-time SFB relayout inside `deepgemm_post_process_weight_scale_block` | superseded by the `transform_sf_into_required_layout` fix in the one surviving patch |
+| `deepseek_v4.py` / `deepseek_v41.py` | DSML tool-call recovery | parser rewritten upstream; see the caveat above |
 
 ## Tested environment
 
 **NVIDIA DGX Station GB300** — single GB300 GPU (SM103 / compute capability 10.3),
 256 GB HBM3e, 494 GB unified LPDDR5x via NVLink-C2C, 72-core Neoverse-V2 (aarch64),
-Ubuntu 24.04, 64K-page kernel (`6.17.0-nvidia-64k`), driver 610.43.02.
+Ubuntu 24.04, 64K-page kernel, driver 610.43.02.
 
-- Image: `vllm/vllm-openai:deepseekv41-flash-0909-cu129-arm64`
-  (vLLM `0.1.dev20904+g179dd0fa9`, torch 2.13.0+cu129), 2026 vendored DeepGEMM of
-  unknown tag. The assert text and the INT-at-`gran_k=32` branch rules out the v2.1.1
-  tag specifically (v2.1.1 gates that branch to `gran_k == 128`); the exact revision is
-  not pinned anywhere in the image.
+- Image: `vllm/vllm-openai:nightly` (vLLM `0.29.1rc1.dev452+g3df4ae153`, pulled
+  2026-09-21). Nightly moves — if a future nightly fixes the layout assert upstream,
+  this patch becomes a no-op (the stride predicate passes valid tensors through) and can
+  be dropped.
 - Model: `deepseek-ai/DeepSeek-V4.1-Flash`
 - GPU selected by **UUID** (`device_ids: ['GPU-…']`), not index — the box also exposes an
-  RTX PRO 4000 that must not be picked up accidentally
+  RTX PRO 4000 that must not be picked up accidentally.
 
 ## Credits
 
 Standing on the shoulders of:
 
 - [tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)
-  — the 4×DGX-Spark reference deployment for this exact model; its boot log (`docs/boot*.md`)
-  is the best available field guide to running V4.1 on Blackwell. Their launcher's
-  `--block-size 128`, `--engram-config` handling and DSpark settings informed this config.
+  — the 4×DGX-Spark reference deployment for this exact model; its `--block-size 128`
+  and DSpark settings informed this config.
 - [vLLM](https://github.com/vllm-project/vllm) — the DeepSeek-V4.1 model code, the
-  `deepseek_v41` tokenizer/parsers, and the layout asserts we work around.
+  `deepseek_v41` tokenizer/parsers, and the layout assert we work around.
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) — `csrc/utils/layout.hpp` is what
   defines the required grouped-scale layout.
 - [DeepSeek-AI](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) — the model.
 
-## Known dead ends
-
-- **NVFP4 checkpoints** (`AtomicChat/DeepSeek-V4.1-Flash-NVFP4-nvidia`): the
-  `FLASHINFER_TRTLLM` NVFP4 MoE backend reports
-  `does not support the deployment configuration since kernel does not support current
-  device cuda` on SM103 in this build.
-- **`DeepGemmMxfp8BmmLinearKernel.process_weights_after_loading` early-returns when
-  `weight.ndim == 3`**, so a 3-D `wo_a` weight never gets its scales repacked by that
-  kernel. This is why the `fp8_einsum` wrapper relayout is still needed alongside the
-  load-time fix.
-
-## Open questions
-
-Things I have not established, stated plainly so nobody builds on them:
-
-- **Why bugs 1 and 3 are SM103-only.** They are host-side layout asserts, so an exact
-  10.0 device should be able to reach the same code. vLLM's own recipe runs this image on
-  GB200 NVL4 (SM100) at TP4, which suggests something selects these paths only on 10.3 —
-  but `has_device_capability(100)` is a *minimum* check and returns `True` on SM103, and a
-  grep for exact-100 gates in the V4/V4.1 model, quantization and MoE-oracle trees found
-  nothing. The gate is either elsewhere or the difference is in the packed-weight layout
-  rather than the gate. Not located.
-- **Why the TRT-LLM FP4 MoE autotune wedges.** It is skipped, not understood: the engine
-  pegs a core indefinitely and writes no autotune cache entries. The reference DGX-Spark
-  deployment skips the same op, which is why that workaround was tried.
-- **Whether a rebuild with `10.3a`/`compute_103` in `TORCH_CUDA_ARCH_LIST` would remove
-  the need for the `sparse_attn_indexer.py` patch.** Likely yes — the `sm_100a` cubins are
-  unusable on SM103 and no forward-compatible PTX is shipped — but that is untested and a
-  far heavier change than a five-line Python patch.
-
 ## License / usage notes
 
 - Everything in this repository is **Apache-2.0**; see `LICENSE`.
-- `patches/*.py` are **derivative works of vLLM** (Apache-2.0). They contain
-  upstream code, modified — not clean-room rewrites.
+- `patches/deep_gemm.py` is a **derivative work of vLLM** (Apache-2.0): nightly's own
+  file, minimally modified — not a clean-room rewrite.
 - The model is subject to **DeepSeek's own license**; this repo ships no weights.
 - Validated on **one DGX Station GB300 at TP1**. Other SM103 configs (multi-GPU /
   P/D-disaggregated) are untested, and a different GB300 SKU could report a different
-  compute capability — check `nvidia-smi --query-gpu=compute_cap` before assuming these
-  patches apply.
+  compute capability — check `nvidia-smi --query-gpu=compute_cap` before assuming this
+  applies.

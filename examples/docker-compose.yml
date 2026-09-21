@@ -1,60 +1,40 @@
 services:
   deepseek-v4.1-flash:
-    image: vllm/vllm-openai:deepseekv41-flash-0909-cu129-arm64
+    # Any vllm/vllm-openai:nightly from 2026-09-10 on serves DeepSeek-V4.1-Flash
+    # (vllm-project/vllm#56228). The launch-day deepseekv41-flash-0909 tag is
+    # deprecated by the official recipe and needs five extra patches.
+    image: vllm/vllm-openai:nightly
     container_name: "vllm-deepseek-v4.1-flash"
-    restart: no #unless-stopped
-
-    dns:
-      - 10.0.0.1
-      - 8.8.8.8
+    restart: unless-stopped
 
     ports:
       - "8001:8001"
 
     volumes:
-      - "/models:/models:ro"
-      - "/models/huggingface-cache:/root/.cache/huggingface"
-      - "/models/vllm-cache:/root/.cache/vllm"          # torch.compile + inductor cache
-      - "/models/flashinfer-cache:/root/.cache/flashinfer"  # FlashInfer JIT kernel cache
-      - "/models/deep-gemm-cache:/root/.deep_gemm"          # DeepGEMM JIT cache (sm_103a)
+      # Model + caches. Adjust HOST_CACHE to wherever you keep weights.
+      - "${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface"
+      - "${VLLM_CACHE:-/root/.cache/vllm}:/root/.cache/vllm"
       - "/tmp/deepseek-v4.1-flash:/tmp"
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/o_proj.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/o_proj.py:ro"
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/fp8_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py:ro"
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
-      # Tool-call recovery (see patches/deepseek_v41.py + patches/deepseek_v4.py).
-      # vLLM's V4.1 DSML parser is a strict state machine with no recovery: a
-      # malformed emission leaks raw markup into content and drops the call.
-      # deepseek_v41.py monkeypatches _preprocess_feed to repair the shapes the
-      # model actually emits; deepseek_v4.py adds the orphan-invoke transition.
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/deepseek_v4.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v4.py:ro"
-      - "/opt/ai-services/deepseek-v4.1-flash/patches/deepseek_v41.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v41.py:ro"
+      # THE one patch this repo still ships. Bind-mount over site-packages.
+      # Paths assume you cloned this repo to /opt/deepseek-v4.1-flash-gb300 —
+      # change the left side to match your checkout.
+      - "/opt/deepseek-v4.1-flash-gb300/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
 
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['GPU-78b03329-6cb3-554c-0c47-02082547b499']
+              # GB300 by UUID. On a box with a display GPU as well, "all"
+              # loads the model onto the wrong card.
+              device_ids: ['GPU-<your-gb300-uuid>']
               capabilities: [gpu]
 
-
     environment:
-      - HF_HOME=/root/.cache/huggingface
-      - HF_TOKEN=${HF_TOKEN:-}
-      - HF_HUB_OFFLINE=1
-      - TRANSFORMERS_OFFLINE=1
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - CUDA_MODULE_LOADING=LAZY
-      - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - VLLM_SLEEP_WHEN_IDLE=1
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS=trtllm_fp4_block_scale_moe,flashinfer::trtllm_fp4_block_scale_moe
-      - CUDA_DEVICE_ORDER=PCI_BUS_ID
-      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - NVIDIA_VISIBLE_DEVICES=GPU-<your-gb300-uuid>
+      - VLLM_ENGINE_READY_TIMEOUT_S=3600   # first load of ~500GB is slow
       - VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
-      - VLLM_DEEP_GEMM_WARMUP=skip
-      - VLLM_ENGINE_READY_TIMEOUT_S=3600
+      - HF_TOKEN=${HF_TOKEN}               # deepseek-ai/DeepSeek-V4.1-Flash is gated
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
     command:
@@ -63,17 +43,17 @@ services:
       - "--tensor-parallel-size"
       - "1"
       - "--gpu-memory-utilization"
-      - "0.92"
+      - "0.92"          # 0.95 OOMs during load / graph capture
       - "--max-model-len"
       - "1048576"
       - "--dtype"
       - "auto"
       - "--compilation-config"
-      - '{"mode": 3, "cudagraph_capture_sizes":[1,6,12,18,24]}'
+      - '{"mode":"VLLM_COMPILE","cudagraph_capture_sizes":[1,6,12,18,24]}'
       - "--cpu-offload-gb"
       - "75"
-      - "--enable-prefix-caching"  # Automatic KV cache optimization
-      - "--enable-chunked-prefill"  # Process long prompts in chunks
+      - "--enable-prefix-caching"
+      - "--enable-chunked-prefill"
       - "--max-num-seqs"
       - "4"
       - "--max-num-batched-tokens"
@@ -85,10 +65,9 @@ services:
       - "--reasoning-parser"
       - "deepseek_v41"
       - "--linear-backend"
-      - "marlin"
-      - "--default-chat-template-kwargs.thinking=True"
+      - "marlin"        # FlashInfer CUTLASS rejects the offloaded weight strides
       - "--block-size"
-      - "128"
+      - "128"           # sparse_mla.py hardcodes 64 only for family(90); 64 => ValueError
       - "--tokenizer-mode"
       - "deepseek_v41"
       - "--speculative-config"
@@ -111,13 +90,9 @@ services:
         soft: -1
         hard: -1
 
-    #mem_limit: 64g
-    #cpus: 8
-
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "f", "http://localhost:8001/health"]
       interval: 30s
       timeout: 10s
       retries: 10
-      start_period: 1200s
-
+      start_period: 600s
