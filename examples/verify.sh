@@ -60,4 +60,20 @@ if leak: print("   FAIL: raw tool-call markup leaked into content"); sys.exit(1)
 if not tc: print("   SKIP: clean refusal (no call, no markup) -- not a failure"); sys.exit(0)
 print("   tool:", tc[0]["function"]["name"], tc[0]["function"]["arguments"][:60]); print("   PASS")'
 
+echo "== vision =="
+# The vision tower is a separate path; a text-only smoke test does not exercise it.
+# 1x1 pink PNG. (Bugs in the quantized attention path produce garbage descriptions,
+# not errors -- so check the answer is a sane short description.)
+out=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d @- <<JSON
+{"model":"$MODEL","max_tokens":64,"temperature":0,"chat_template_kwargs":{"thinking":false},
+ "messages":[{"role":"user","content":[{"type":"text","text":"Describe this image in five words."},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}]}]}
+JSON
+)
+echo "$out" | python3 -c '
+import json,sys
+m=json.load(sys.stdin)["choices"][0]["message"]
+c=(m.get("content") or "").strip()
+if not c: print("   FAIL: empty content", repr(m.get("reasoning"))[:80]); sys.exit(1)
+print("   described:", repr(c[:80])); print("   PASS")'
+
 echo; echo "all checks passed"
