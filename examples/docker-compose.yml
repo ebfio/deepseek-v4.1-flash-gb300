@@ -33,7 +33,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=GPU-<your-gb300-uuid>
       - VLLM_ENGINE_READY_TIMEOUT_S=3600   # first load of ~500GB is slow
-      - VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1
       - HF_TOKEN=${HF_TOKEN}               # deepseek-ai/DeepSeek-V4.1-Flash is gated
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -43,21 +42,23 @@ services:
       - "--tensor-parallel-size"
       - "1"
       - "--gpu-memory-utilization"
-      - "0.92"          # 0.95 OOMs during load / graph capture
+      - "0.9230"        # vLLM logs its own safe max; 0.95 OOMs during graph capture
       - "--max-model-len"
       - "1048576"
       - "--dtype"
       - "auto"
       - "--compilation-config"
-      - '{"mode":"VLLM_COMPILE","cudagraph_capture_sizes":[1,6,12,18,24]}'
+      # dspark k=3: sizes must be multiples of decode_query_len=4 AND <=
+      # max_num_seqs x 4, or vLLM silently DROPS them and those batches run eager.
+      - '{"mode":"VLLM_COMPILE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32]}'
       - "--cpu-offload-gb"
       - "75"
       - "--enable-prefix-caching"
       - "--enable-chunked-prefill"
       - "--max-num-seqs"
-      - "4"
+      - "8"
       - "--max-num-batched-tokens"
-      - "8192"
+      - "16384"         # 8k -> 16k: ~5x faster long-prompt prefill; costs ~1.7M KV tokens
       - "--trust-remote-code"
       - "--tool-call-parser"
       - "deepseek_v41"
@@ -65,13 +66,16 @@ services:
       - "--reasoning-parser"
       - "deepseek_v41"
       - "--linear-backend"
-      - "marlin"        # FlashInfer CUTLASS rejects the offloaded weight strides
+      - "auto"          # pure cute-dsl w/ the two FlashInfer patches above; use "marlin"
+                        # instead if you skip those mounts
       - "--block-size"
       - "128"           # sparse_mla.py hardcodes 64 only for family(90); 64 => ValueError
       - "--tokenizer-mode"
       - "deepseek_v41"
       - "--speculative-config"
-      - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+      - '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"greedy"}'
+      # k=3 greedy beats k=5 probabilistic on this model: 63% acceptance efficiency
+      # (1.90 accepted/step vs 1.51) and 4-wide graphs fit every capture size.
       - "--served-model-name"
       - "deepseek-v4.1-flash"
       - "--host"

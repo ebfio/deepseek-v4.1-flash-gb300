@@ -1,8 +1,8 @@
-# DeepSeek-V4.1-Flash on DGX Station GB300 (SM103) — one patch for the official vLLM nightly
+# DeepSeek-V4.1-Flash on DGX Station GB300 (SM103) — three small patches, official vLLM nightly, 100 tok/s
 
 Run **DeepSeek-V4.1-Flash** (522B MoE / 8-16B active) on an **NVIDIA DGX Station GB300**
-with the official `vllm/vllm-openai:nightly` image — plus exactly **one** bind-mounted
-patch.
+with the official `vllm/vllm-openai:nightly` image — plus three small bind-mounted
+patches (one required, two optional-but-recommended) and a measured launch config.
 
 > **Nightly, not the launch tag.** Any nightly from 2026-09-10 on serves this model
 > natively ([vllm-project/vllm#56228](https://github.com/vllm-project/vllm/pull/56228));
@@ -17,11 +17,19 @@ failure modes.
 
 ```
 patches/
-  deep_gemm.py             # grouped UE8M0 scale layout (the one live bug)
+  deep_gemm.py                 # grouped UE8M0 scale layout (the one live vLLM bug)
+  kernel_warmup.py             # autotune floor-mapping fix, one line (vLLM side)
+  flashinfer_mxfp8_rowmajor.py # row-major MXFP8 weight storage (FlashInfer stride bug)
 examples/
-  docker-compose.yml       # working config, all values measured
-  verify.sh                # math / long-context / tool-calling / vision checks
+  docker-compose.yml           # working config, all values measured
+  verify.sh                    # math / long-context / tool-calling / vision checks
 ```
+
+Two of the three are optional-but-recommended: `deep_gemm.py` is required for a clean
+boot on any nightly right now. The other two unlock `--linear-backend auto` (pure
+cute-dsl MXFP8 GEMMs — faster decode AND prefill than the default, plus ~2.4x KV
+capacity via freed HBM); without them, set `--linear-backend marlin` instead and skip
+those two mounts. All three are bind-mounts — upstream images stay untouched.
 
 ## The bug
 
@@ -72,6 +80,49 @@ torch, and boot-proven on the real checkpoint.
 A wrong-but-legal scale layout produces **garbage text, not an assert** — if you change
 anything in this area, rerun the correctness checks below, never just a health check.
 
+### MXFP8 linear weight storage — `flashinfer_mxfp8_rowmajor.py`
+
+FlashInfer's cute-dsl `mm_mxfp8` (the `--linear-backend auto` path on SM100/103) stores
+linear weights column-major `[K, N]` and passes them straight to the FFI. Any later
+copy that flattens the tensor (e.g. vLLM's unpinned UVA re-offload of CPU-offloaded
+weights) silently turns it row-major, and the first forward dies with
+`ValueError: Mismatched mB.strides[1]` in `compiled_gemm`. The fix is to store the
+fixed point of every copy path — row-major `[N, K]` — and pass `weight.t()` at apply
+time (the same contract CUTLASS-class kernels use). Validated against the reference
+GEMM at all dense-layer shapes; boot- and serving-proven at M 1…16384.
+
+With this patch, pure cute-dsl beats the default marlin path on **both** sides of the
+step: decode (8–10 µs vs 14–16 µs per fused_wqa_wkv under CUDA-graph replay) and
+prefill (~204 µs vs ~914 µs at M=16384). It also deletes marlin's ~3.7 GiB HBM
+quantization stash — on our 962 GB card that alone moved KV capacity 2.13M → 5.12M
+tokens.
+
+### FlashInfer warmup floor-mapping — `kernel_warmup.py`
+
+Inside `autotune(tuning_buckets=...)` the FlashInfer autotuner *replaces* the op's own
+round-up bucket mapper with a round-down one. vLLM's warmup runs the model inside that
+context, so a dummy-run forward at a non-bucket M (the DSpark draft at 8 reqs × 3 =
+24 tokens) looks up the bucket-16 tactic — whose split-K MMA tile (128,16) is then
+rejected by the apply-time validator, because `mma_tiler_mn_for_m(24)` is (128,32):
+
+```
+ValueError: Invalid MXFP8 split-K tactic: ((128, 16), (1, 1), True, False, 4)
+```
+
+Outside the tune context (serving + CUDA-graph capture) the op's own round-up mapper
+is used, so **only the warmup pass ever crashes** — the engine crash-loops at boot
+while serving would have been fine. Fix is one line at `kernel_warmup.py:363`:
+`autotune(tuning_buckets=tuning_buckets, round_up=True)`. Verified by a standalone
+repro on the GB300: floor-mapped M=24/12/40 all fail with byte-identical tuples to the
+engine crash; `round_up=True` clears all three in the same process, same cache.
+
+> Broader hazard, not fixed here: the *base* (non-split-K) tactic candidates include
+> small swap-AB tiles that get **no** apply-time check — under floor mapping a
+> (128,16) winner tuned at bucket 16 can be applied at M=24, silently outside its
+> envelope. The split-K validator is just the one place that notices. `mm_fp4`
+> shares the same tactic generator, so NVFP4 models with speculative decoding are
+> exposed to the same family of bugs.
+
 ## The thinking-flag trap
 
 The V4.1 chat template defaults to **thinking ON at effort 50** when no keys are sent.
@@ -95,12 +146,14 @@ Several flags differ from a naive SM90 port, and all are load-bearing:
 | flag | value | why |
 |---|---|---|
 | `--block-size` | **128** | `models/deepseek_v41/sparse_mla.py:90` hardcodes `64 if family(90) else 128`. Passing 64 gives `ValueError: No common block size for 64`. |
-| `--gpu-memory-utilization` | **0.92** | 0.95 OOMs during load / graph capture. |
-| `--cpu-offload-gb` | **75** | see the sweep below. |
+| `--gpu-memory-utilization` | **0.9230** | vLLM logs its own safe max on boot; 0.95 OOMs during graph capture. |
+| `--cpu-offload-gb` | **75** + `--cpu-offload-params experts` | see the sweep below; `experts` also pins the dense projections back to HBM (they're read every decode step). |
 | `--max-model-len` | **1048576** | required for 1M context. |
-| `--linear-backend` | **marlin** | FlashInfer CUTLASS rejects the offloaded weight strides; the dense projections are not the bottleneck. Attention runs the native `flash_mla_mega_attn` path regardless of this flag — the marlin pin only governs the dense projections, and it does **not** protect against the DeepGEMM assert (the crash is in the attention einsum). |
-| `--speculative-config` | `dspark`, 5 tokens, **probabilistic** | `draft_sample_method: probabilistic`. |
+| `--linear-backend` | **auto** | Pure cute-dsl MXFP8 with the two FlashInfer patches. Beats marlin on both decode (8–10 µs vs 14–16 µs under replay) and prefill (~204 µs vs ~914 µs at M=16384), and frees marlin's ~3.7 GiB stash (KV 2.13M → 5.12M tokens). Use `marlin` if you skip the patches — attention runs the native `flash_mla_mega_attn` path regardless of this flag. |
+| `--speculative-config` | `dspark`, **3 tokens, greedy** | k=3 greedy beats k=5 probabilistic on this model: 63% acceptance efficiency (1.90 accepted/step vs 1.51) — greedy matches the draft's argmax training; the extra k=5 slots were rejected anyway. |
 | `--tokenizer-mode` / parsers | `deepseek_v41` | V4.1 DSML dialect; the `deepseek_v4` parser leaks raw markup into content. |
+| `cudagraph_capture_sizes` | **[4,8,12,16,20,24,28,32]** | under dspark, sizes must be multiples of `decode_query_len=4` AND ≤ `max_num_seqs×4` — vLLM silently DROPS anything else and those batches run **eager**. [1,6,12,18,24] kept only 5/5 and left 7-8-seq decode eager. |
+| `--max-num-batched-tokens` | **16384** | ~5× faster long-prompt prefill vs 8192; costs ~1.7M KV tokens (see Results note). |
 
 ### CPU offload: the floor is structural
 
@@ -127,19 +180,31 @@ not a speed one. On nightly the same 75 yields an even larger pool (below) thank
 
 ## Results
 
-DGX Station GB300, single GPU, `--tensor-parallel-size 1`, thinking off:
+DGX Station GB300, single GPU, `--tensor-parallel-size 1`, thinking off.
+Tuned config = the full recipe below (k=3 DSpark + pure cute-dsl + capture sizes
+`[4,8,12,16,20,24,28,32]`):
 
-| metric | 0909 image (six patches) | **nightly (this repo)** |
-|---|---|---|
-| KV cache | 4,458,466 tokens (9.36 GiB) | **6,845,219 tokens (6.53× @ 1M ctx)** |
-| attention path | pre-mega | **native `flash_mla_mega_attn`** |
-| decode (code, warm) | 91.7 tok/s | ~91.5 tok/s |
-| correctness | `17*19 → 323` | `17*19 → 323` |
-| vision | untested | 1×1 image → correct short description |
-| tool calling | via recovery patches | upstream rewritten parser; smoke-tested clean |
+| metric | 0909 image (six patches) | first nightly | **tuned (this repo)** |
+|---|---|---|---|
+| KV cache | 4,458,466 tokens | 6,845,219 (6.53× @1M) | **5,123,184 (4.89× @1M)** |
+| decode (prose, two-length slope) | — | ~83 tok/s | **100.1 tok/s** |
+| decode (counting; DSpark accepts 100%) | — | — | 198.5 tok/s |
+| prefill (109k-token prompt) | — | ~4,000 tok/s | **22,975 tok/s** |
+| CUDA graphs (FULL) | partial | 5/5 but top batches eager | **8/8 + DSpark 6/6** |
+| attention path | pre-mega | native `flash_mla_mega_attn` | same |
+| correctness | `17*19 → 323` | `17*19 → 323` | `17*19 → 323` |
+| vision | untested | 1×1 image → correct short description | verified again |
+| tool calling | via recovery patches | upstream rewritten parser; smoke-tested | smoke-tested clean |
 
-Boot: weights 48/48 shards in ~90 s, DSpark draft load, CUDA graph capture 3 s,
-health 200 at ~14 min (first nightly boot JIT-compiles kernels).
+> The tuned KV number is LOWER than the first nightly's 6.85M on purpose: 6.85M came
+> from `--max-num-batched-tokens 8192` (prefill chunks capped at 8k). The tuned recipe
+> raises it to 16384 for ~5× faster long-prompt prefill and pays ~1.7M tokens of KV —
+> and still holds **~5 concurrent 1M-token sessions**. If you want max KV instead of
+> prefill speed, set `--max-num-batched-tokens 8192`.
+
+Boot: weights 48/48 shards in ~90 s, DSpark draft load, autotune warmup ~3 min
+(cache-hit ~5 s), CUDA graph capture 3 s, health 200 at ~14 min (first boot
+JIT-compiles kernels).
 
 Reproduce correctness with `examples/verify.sh` (tests math, long-context needle
 retrieval, tool calling, and vision — a wrong-but-legal scale layout produces garbage
@@ -158,11 +223,15 @@ git clone https://github.com/ebfio/deepseek-v4.1-flash-gb300 /opt/deepseek-v4.1-
 docker compose -f examples/docker-compose.yml up -d
 ```
 
-The single mount (adjust the left side to your checkout):
+The three mounts (adjust the left sides to your checkout):
 
 ```yaml
 volumes:
   - "/opt/deepseek-v4.1-flash-gb300/patches/deep_gemm.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py:ro"
+  # optional pair: unlocks --linear-backend auto (pure cute-dsl). Skip BOTH
+  # and use --linear-backend marlin instead if you want a zero-extra-patch boot.
+  - "/opt/deepseek-v4.1-flash-gb300/patches/flashinfer_mxfp8_rowmajor.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:ro"
+  - "/opt/deepseek-v4.1-flash-gb300/patches/kernel_warmup.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py:ro"
 ```
 
 A changed patch needs a **recreate**, not a restart: bind mounts resolve at container
